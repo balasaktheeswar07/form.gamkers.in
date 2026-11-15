@@ -81,6 +81,13 @@ def create_app(test_config=None):
         engine_options.setdefault("pool_timeout", 20)
         app.config["SQLALCHEMY_ENGINE_OPTIONS"] = engine_options
 
+    # HIGH-03: no cookie may leave the app without SameSite (see app.security).
+    from app.security import EnforceCookieAttributes
+
+    app.wsgi_app = EnforceCookieAttributes(
+        app.wsgi_app, app.config.get("SESSION_COOKIE_SAMESITE") or "Lax"
+    )
+
     db.init_app(app)
     migrate.init_app(app, db)
     login_manager.init_app(app)

@@ -1,3 +1,4 @@
+import threading
 from datetime import timedelta
 
 from flask import Blueprint, current_app, flash, redirect, render_template, request, url_for
@@ -12,6 +13,11 @@ from app.urls import absolute_app_url
 from app.utils import utcnow
 
 auth = Blueprint("auth", __name__)
+
+PASSWORD_RESET_TTL = timedelta(minutes=30)
+# Per-account cap on reset emails, enforced from the database so it holds across
+# worker processes (the in-memory limiter store is per-process) and across IPs.
+PASSWORD_RESET_MAX_PER_HOUR = 3
 
 
 @auth.route("/login", methods=["GET", "POST"])
@@ -41,30 +47,79 @@ def logout():
     return redirect(url_for("main.home"))
 
 
+def _issue_password_reset(email):
+    """Create a reset token for ``email`` and mail it, if the account exists.
+
+    Runs outside the request/response path (see ``_dispatch_password_reset``) so the
+    HTTP response never depends on whether the account exists, how busy the database
+    is, or how long SMTP takes. Never raises.
+    """
+    try:
+        user = db.session.scalar(db.select(User).where(User.email == email))
+        if not user:
+            return
+        # PasswordReset has no created_at; expires_at is always created + TTL, so a
+        # row created in the last hour has expires_at > now - 1h + TTL.
+        recent = db.session.scalar(
+            db.select(func.count(PasswordReset.id)).where(
+                PasswordReset.user_id == user.id,
+                PasswordReset.expires_at > utcnow() - timedelta(hours=1) + PASSWORD_RESET_TTL,
+            )
+        )
+        if recent >= PASSWORD_RESET_MAX_PER_HOUR:
+            current_app.logger.warning("Password reset throttled for user id %s.", user.id)
+            return
+        PasswordReset.query.filter_by(user_id=user.id, used_at=None).update(
+            {"used_at": utcnow()}, synchronize_session=False
+        )
+        token = new_token()
+        db.session.add(
+            PasswordReset(
+                user_id=user.id,
+                token_hash=hash_token(token),
+                expires_at=utcnow() + PASSWORD_RESET_TTL,
+            )
+        )
+        db.session.commit()
+        link = absolute_app_url("auth.reset_password", token=token)
+        if not send_email(
+            user.email,
+            "Reset your GAMKERS PORTAL password",
+            f"Reset your password within 30 minutes:\n\n{link}",
+            user.organization,
+        ):
+            current_app.logger.warning("Password reset email not sent: no SMTP configuration.")
+    except Exception:
+        db.session.rollback()
+        current_app.logger.exception("Password reset processing failed.")
+
+
+def _dispatch_password_reset(email):
+    """Hand the reset work off so every valid-looking request returns equally fast."""
+    app = current_app._get_current_object()
+    if app.config.get("PASSWORD_RESET_INLINE_DELIVERY", app.testing):
+        _issue_password_reset(email)
+        return
+
+    def run():
+        # url_for() needs a request context when SERVER_NAME is unset.
+        with app.app_context(), app.test_request_context():
+            try:
+                _issue_password_reset(email)
+            finally:
+                db.session.remove()
+
+    threading.Thread(target=run, name="password-reset", daemon=True).start()
+
+
 @auth.route("/forgot-password", methods=["GET", "POST"])
-@limiter.limit("5 per hour")
+@limiter.limit("5 per hour;20 per day", methods=["POST"])
 def forgot_password():
     if request.method == "POST":
         email = request.form.get("email", "").strip().lower()
-        user = db.session.scalar(db.select(User).where(User.email == email)) if valid_email(email) else None
-        if user:
-            PasswordReset.query.filter_by(user_id=user.id, used_at=None).update(
-                {"used_at": utcnow()}, synchronize_session=False
-            )
-            token = new_token()
-            reset = PasswordReset(
-                user_id=user.id,
-                token_hash=hash_token(token),
-                expires_at=utcnow() + timedelta(minutes=30),
-            )
-            db.session.add(reset)
-            db.session.commit()
-            try:
-                link = absolute_app_url("auth.reset_password", token=token)
-                if not send_email(user.email, "Reset your GAMKERS PORTAL password", f"Reset your password within 30 minutes:\n\n{link}", user.organization):
-                    current_app.logger.warning("Password reset email not sent: no SMTP configuration.")
-            except Exception:
-                current_app.logger.exception("Password reset email delivery failed.")
+        if valid_email(email):
+            _dispatch_password_reset(email)
+        # Same response whether or not the account exists, was throttled, or failed.
         flash("If an account matches that email, a password reset link will be sent.", "info")
         return redirect(url_for("auth.forgot_password"))
     return render_template("auth/forgot_password.html")

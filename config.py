@@ -18,11 +18,21 @@ class Config:
         "pool_recycle": 280,  # Replace connections before a 300 s server wait_timeout.
     }
     MAX_CONTENT_LENGTH = 16 * 1024 * 1024
+
+    # Cookie hardening (HIGH-03). Every cookie the app emits must carry the same
+    # attributes. Flask-Login's remember-me cookie does NOT inherit SESSION_COOKIE_*,
+    # so it needs its own SameSite; app.security.EnforceCookieAttributes is a
+    # backstop that adds SameSite to any Set-Cookie that still lacks it.
+    SESSION_COOKIE_NAME = "session"
+    SESSION_COOKIE_PATH = "/"
     SESSION_COOKIE_HTTPONLY = True
-    SESSION_COOKIE_SAMESITE = "Lax"
+    SESSION_COOKIE_SAMESITE = "Lax"  # "Strict" is stronger but breaks logins via external links
     SESSION_COOKIE_SECURE = os.getenv("SECURE_COOKIES", "0") == "1"
+    REMEMBER_COOKIE_PATH = "/"
     REMEMBER_COOKIE_HTTPONLY = True
+    REMEMBER_COOKIE_SAMESITE = SESSION_COOKIE_SAMESITE
     REMEMBER_COOKIE_SECURE = SESSION_COOKIE_SECURE
+
     WTF_CSRF_TIME_LIMIT = 3600
     RATELIMIT_STORAGE_URI = os.getenv("RATELIMIT_STORAGE_URI", "memory://")
     RATELIMIT_HEADERS_ENABLED = True

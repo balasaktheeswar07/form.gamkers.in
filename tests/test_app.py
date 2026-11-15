@@ -45,6 +45,29 @@ def test_public_signup_is_disabled_and_cli_creates_the_single_admin(client, app)
     assert "single admin account" in result.output
 
 
+def test_session_cookie_uses_lax_samesite(client, app):
+    result = client.application.test_cli_runner().invoke(
+        args=["create-admin", "--name", "Alex Admin", "--email", "admin@example.com"],
+        input="a-very-long-password\na-very-long-password\n",
+    )
+    assert result.exit_code == 0, result.output
+
+    response = client.post(
+        "/admin/login",
+        data={"email": "admin@example.com", "password": "a-very-long-password"},
+    )
+
+    session_cookies = [
+        cookie
+        for cookie in response.headers.getlist("Set-Cookie")
+        if cookie.startswith("session=")
+    ]
+    assert response.status_code == 302
+    assert app.config["SESSION_COOKIE_SAMESITE"] == "Lax"
+    assert len(session_cookies) == 1
+    assert "SameSite=Lax" in session_cookies[0]
+
+
 def test_form_can_be_published_and_sends_a_confirmation(app, client, monkeypatch):
     register(client)
     questions = [

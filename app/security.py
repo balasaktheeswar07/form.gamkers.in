@@ -1,4 +1,5 @@
 import hashlib
+import re
 import secrets
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -42,3 +43,41 @@ def valid_email(value):
         return True
     except EmailNotValidError:
         return False
+
+
+_SAMESITE_ATTRIBUTE = re.compile(r";\s*samesite\s*=", re.IGNORECASE)
+_VALID_SAMESITE = {"lax": "Lax", "strict": "Strict", "none": "None"}
+
+
+class EnforceCookieAttributes:
+    """WSGI backstop: guarantee every ``Set-Cookie`` header carries ``SameSite``.
+
+    Flask finalises the session cookie, and Flask-Login its remember-me cookie,
+    *after* ``after_request`` hooks run, so a hook cannot see them. Wrapping the
+    WSGI app sees every cookie that actually leaves the process, whichever code
+    path (or future ``response.set_cookie`` call) produced it. Browsers that
+    default a missing ``SameSite`` to ``None`` would otherwise send such a cookie
+    on cross-site requests (CSRF exposure). An explicit ``SameSite`` is never
+    overridden.
+    """
+
+    def __init__(self, wsgi_app, default_samesite="Lax"):
+        self.wsgi_app = wsgi_app
+        self.default_samesite = _VALID_SAMESITE.get(
+            str(default_samesite or "Lax").lower(), "Lax"
+        )
+
+    def _patch(self, cookie):
+        if _SAMESITE_ATTRIBUTE.search(cookie):
+            return cookie
+        return f"{cookie}; SameSite={self.default_samesite}"
+
+    def __call__(self, environ, start_response):
+        def patched_start_response(status, headers, exc_info=None):
+            headers = [
+                (name, self._patch(value)) if name.lower() == "set-cookie" else (name, value)
+                for name, value in headers
+            ]
+            return start_response(status, headers, exc_info)
+
+        return self.wsgi_app(environ, patched_start_response)
